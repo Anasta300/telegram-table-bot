@@ -1,0 +1,225 @@
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler
+import time
+import requests
+from datetime import datetime, timedelta
+
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "8345014495:AAGjAMly1nCRqoPHJYDhRaQ_o4WXSiVUC6o"
+YMONEY_TOKEN = "4100118649982446.F39857C0F941EA599188546D1EACBF05E9B0B51FD7646815F39B552714C0ADC7968093E2EB68A8322F886F3806ED4D78A4CEBB29366DABCE5D07ED0C271D22CE474046FD80B78004AD68CE73F6FC6B2FE0070097DD112493173ADF6362556B54C742E83E7A7572F7EC9A65B4AF8AFA37545436C507CA0C087135155E16E91710"
+YMONEY_WALLET = "4100118649982446"
+
+# 🔗 ССЫЛКИ НА ТАБЛИЦЫ
+DEMO_SHEET_URL = "https://docs.google.com/spreadsheets/d/1oUXk621AL0fVQoMCq29Th7J2gi855l__/edit?usp=sharing&ouid=118098768944350332547&rtpof=true&sd=true"  # Демо (сокращенная версия)
+FULL_SHEET_URL = "https://docs.google.com/spreadsheets/d/1aQdZNhSiNOzDHet0ocN6ftD16Wi9FT6Z/edit?usp=sharing&ouid=118098768944350332547&rtpof=true&sd=true"  # Полная версия
+
+# Настройки комиссии
+EXPECTED_AMOUNT = 300
+MIN_AMOUNT = 291
+
+# 🔧 НАСТРОЙКА АДМИНА
+ADMIN_ID = 895676610
+# ==============================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+orders = {}
+
+async def start(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    order_id = f"{user_id}_{int(time.time())}"
+    comment = f"table_{order_id}"
+    
+    orders[order_id] = {
+        'user_id': user_id,
+        'expected_amount': EXPECTED_AMOUNT,
+        'min_amount': MIN_AMOUNT,
+        'comment': comment,
+        'paid': False,
+        'created_at': time.time()
+    }
+    
+    payment_url = f"https://yoomoney.ru/quickpay/confirm?receiver={YMONEY_WALLET}&sum={EXPECTED_AMOUNT}&quickpay-form=shop&label={comment}"
+    
+    # Клавиатура с кнопками
+    keyboard = [
+        [InlineKeyboardButton("📊 Бесплатная демо-версия", url=DEMO_SHEET_URL)],
+        [InlineKeyboardButton("💳 Купить полную версию - 300 руб", url=payment_url)],
+        [InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_{order_id}")]
+    ]
+    
+    # Приветственное сообщение с акцентом на демо и преимуществах полной версии
+    await update.message.reply_text(
+        f"👋 Добрый день, {user_name}!\n\n"
+        f"*Бесплатная демо-версия*\n"
+        f"• Ознакомительный вариант таблицы\n"
+        f"• Содержит основные разделы\n"
+        f"• Доступна сразу\n\n"
+        f"*Полная версия за {EXPECTED_AMOUNT} руб*\n"
+        f"• ✅ Все 3 раздела таблицы\n"
+        f"• ✅ Расширенные функции\n"
+        f"• ✅ Полный доступ навсегда\n\n"
+        f"🎯 *Познакомьтесь с демо-версией, и если понравится - приобретайте полную!*\n\n"
+        f"После оплаты нажмите ✅ Проверить оплату.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def check_yoomoney_payment(order_id):
+    """Проверяет платеж по сумме и времени (без комментария)"""
+    try:
+        order = orders.get(order_id)
+        if not order:
+            print(f"❌ Заказ {order_id} не найден")
+            return False
+        
+        print(f"🔍 Ищем платеж для заказа {order_id}")
+        print(f"   Ожидаемая сумма: {order['expected_amount']} руб")
+        print(f"   Минимальная сумма: {order['min_amount']} руб")
+        
+        # Увеличиваем период поиска до 24 часов заменила на 1 час 
+        to_date = datetime.now()
+        from_date = to_date - timedelta(hours=1)
+        from_date_str = from_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_date_str = to_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        headers = {'Authorization': f'Bearer {YMONEY_TOKEN}'}
+        params = {
+            'type': 'deposition',
+            'from': from_date_str,
+            'till': to_date_str,
+            'records': '50'
+        }
+        
+        response = requests.post(
+            'https://yoomoney.ru/api/operation-history',
+            headers=headers,
+            data=params
+        )
+        
+        print(f"📊 Статус API: {response.status_code}")
+        
+        if response.status_code == 200:
+            operations = response.json().get('operations', [])
+            print(f"📋 Найдено операций: {len(operations)}")
+            
+            # Ищем платеж только по сумме и статусу (без комментария)
+            for operation in operations:
+                op_amount = float(operation.get('amount', 0))
+                op_status = operation.get('status', '')
+                op_direction = operation.get('direction', '')
+                
+                print(f"🔎 Проверяем операцию: {op_amount} руб, статус: {op_status}")
+                
+                # Проверяем по сумме (в диапазоне) и статусу
+                if (order['min_amount'] <= op_amount <= order['expected_amount'] and
+                    op_status == 'success' and
+                    op_direction == 'in'):
+                    
+                    print(f"✅ Найден подходящий платеж! Сумма: {op_amount} руб")
+                    return True
+            
+            print("❌ Подходящий платеж не найден")
+            
+        else:
+            print(f"❌ Ошибка API: {response.status_code}")
+            print(f"Текст ошибки: {response.text}")
+            
+        return False
+        
+    except Exception as e:
+        print(f"💥 Ошибка: {e}")
+        return False
+
+async def button_handler(update: Update, context: CallbackContext) -> None:
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("check_"):
+        order_id = query.data.replace("check_", "")
+        
+        order = orders.get(order_id)
+        if order and (time.time() - order['created_at']) < 30:
+            await query.answer("⏳ Подождите 30 секунд после оплаты", show_alert=True)
+            return
+        
+        checking_msg = await query.message.reply_text("🔍 Проверяем оплату...")
+        is_paid = await check_yoomoney_payment(order_id)
+        await context.bot.delete_message(chat_id=query.message.chat_id, message_id=checking_msg.message_id)
+        
+        if is_paid:
+            orders[order_id]['paid'] = True
+            await query.message.reply_text(
+                f"✅ *Оплата подтверждена!*\n\n"
+                f"💎 *Вот ваша полная версия таблицы:*\n{FULL_SHEET_URL}\n\n"
+                f"📚 *Что включено в полную версию:*\n"
+                f"• Все 3 раздела таблицы\n"
+                f"• Расширенные функции\n"
+                f"• Полный доступ навсегда\n\n"
+                f"Приятного пользования! 📊",
+                parse_mode='Markdown'
+            )
+        else:
+            keyboard = [[InlineKeyboardButton("🔄 Проверить еще раз", callback_data=f"check_{order_id}")]]
+            await query.message.reply_text(
+                "❌ *Оплата не найдена.*\n\n"
+                "Возможные причины:\n"
+                "• Платеж еще обрабатывается (1-5 минут)\n"
+                "• Проблемы с API\n\n"
+                "Попробуйте проверить через пару минут:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+async def adjust_commission(update: Update, context: CallbackContext) -> None:
+    """Команда для настройки комиссии (только для админа)"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет прав для этой команды")
+        return
+    
+    if context.args:
+        try:
+            new_min_amount = int(context.args[0])
+            global MIN_AMOUNT
+            MIN_AMOUNT = new_min_amount
+            await update.message.reply_text(f"✅ Минимальная сумма изменена на {MIN_AMOUNT} руб")
+        except ValueError:
+            await update.message.reply_text("❌ Используйте: /commission <сумма>")
+    else:
+        await update.message.reply_text(
+            f"📊 Текущие настройки комиссии:\n"
+            f"Ожидаемая сумма: {EXPECTED_AMOUNT} руб\n"
+            f"Минимальная сумма: {MIN_AMOUNT} руб\n\n"
+            f"Использование: /commission <минимальная_сумма>"
+        )
+
+async def get_my_id(update: Update, context: CallbackContext) -> None:
+    """Команда для получения своего Telegram ID"""
+    user_id = update.effective_user.id
+    await update.message.reply_text(f"🆔 Ваш Telegram ID: `{user_id}`", parse_mode='Markdown')
+
+def main():
+    print("🚀 Запускаем бота с демо-версией и полной версией")
+    print(f"💰 Полная версия: {EXPECTED_AMOUNT} руб")
+    print(f"📉 Минимальная сумма: {MIN_AMOUNT} руб")
+    print(f"🔗 Демо-версия: {DEMO_SHEET_URL}")
+    print(f"🔗 Полная версия: {FULL_SHEET_URL}")
+    print(f"👑 Admin ID: {ADMIN_ID}")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("commission", adjust_commission))
+    application.add_handler(CommandHandler("myid", get_my_id))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
